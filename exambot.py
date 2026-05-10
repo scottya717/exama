@@ -70,8 +70,8 @@ class QuestionFile(Base):
     __tablename__ = 'question_files'
     id = Column(Integer, primary_key=True)
     question_id = Column(Integer, ForeignKey('questions.id'))
-    file_id = Column(String, nullable=False)  # Telegram file_id
-    file_type = Column(String, nullable=False)  # document, photo, audio, video
+    file_id = Column(String, nullable=False)
+    file_type = Column(String, nullable=False)
     file_name = Column(String, nullable=True)
     caption = Column(String, nullable=True)
     uploaded_at = Column(DateTime, default=datetime.now)
@@ -547,7 +547,7 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_type = 'document'
         file_name = update.message.document.file_name or "Документ"
     elif update.message.photo:
-        file_id = update.message.photo[-1].file_id  # Берём самое большое фото
+        file_id = update.message.photo[-1].file_id
         file_type = 'photo'
         file_name = "Фото"
     elif update.message.audio:
@@ -646,7 +646,6 @@ async def view_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Отправляем файлы по одному
     type_emoji = {'document': '📄', 'photo': '🖼', 'audio': '🎵', 'video': '🎥'}
     
     await query.edit_message_text(
@@ -833,7 +832,6 @@ async def show_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, knew_i
         text, parse_mode='MarkdownV2', reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    # Отправляем файлы вопроса, если есть
     if q.files:
         type_emoji = {'document': '📄', 'photo': '🖼', 'audio': '🎵', 'video': '🎥'}
         for f in q.files:
@@ -1621,6 +1619,19 @@ def main():
     
     application = Application.builder().token(TOKEN).build()
     
+    # Восстанавливаем напоминания при запуске
+    session = Session()
+    users_with_reminders = session.query(User).filter_by(reminder_enabled=True).all()
+    for user in users_with_reminders:
+        hour, minute = map(int, user.reminder_time.split(':'))
+        application.job_queue.run_daily(
+            send_reminder,
+            time=datetime.time(hour=hour, minute=minute),
+            chat_id=user.telegram_id,
+            name=str(user.telegram_id)
+        )
+    session.close()
+    
     # Conversation: добавление дисциплины
     disc_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(add_discipline_start, pattern='^add_discipline$')],
@@ -1629,7 +1640,10 @@ def main():
             DISCIPLINE_QUESTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_discipline_questions)],
             DISCIPLINE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_discipline_date)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(back_handler, pattern='^(main_menu|my_disciplines)$')
+        ],
     )
     
     # Conversation: добавление вопроса
@@ -1640,7 +1654,10 @@ def main():
             QUESTION_CHEATSHEET: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_cheatsheet)],
             QUESTION_DIFFICULTY: [CallbackQueryHandler(get_difficulty, pattern='^diff_')],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(back_handler, pattern='^(questions_list_|discipline_)')
+        ],
     )
     
     # Conversation: поиск
@@ -1649,24 +1666,99 @@ def main():
         states={
             SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, do_search)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(back_handler, pattern='^main_menu$')
+        ],
     )
     
     # Conversation: редактирование шпаргалки
     edit_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(edit_cheatsheet_start, pattern='^edit_cheatsheet_')],
         states={
-            EDIT_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_edited_cheatsheet)],
+            EDIT_CHEATSHEET: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_edited_cheatsheet)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(back_handler, pattern='^question_')
+        ],
     )
     
+    # Conversation: напоминания
+    reminder_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(change_reminder_time_start, pattern='^change_reminder_time$')],
+        states={
+            REMINDER_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_reminder_time)],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(back_handler, pattern='^reminder_settings$')
+        ],
+    )
+    
+    # Conversation: присоединение к дисциплине
+    join_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(join_discipline_start, pattern='^join_discipline$')],
+        states={
+            JOIN_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, join_discipline_process)],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(back_handler, pattern='^sharing_menu$')
+        ],
+    )
+    
+    # Conversation: добавление файла
+    file_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_file_start, pattern='^add_file_')],
+        states={
+            FILE_UPLOAD: [
+                MessageHandler(filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VOICE | filters.VIDEO, process_file)
+            ],
+            FILE_CAPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_file)],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(back_handler, pattern='^question_')
+        ],
+    )
+    
+    # Основные команды
     application.add_handler(CommandHandler('start', start))
+    
+    # Conversations
     application.add_handler(disc_conv)
     application.add_handler(q_conv)
     application.add_handler(search_conv)
     application.add_handler(edit_conv)
+    application.add_handler(reminder_conv)
+    application.add_handler(join_conv)
+    application.add_handler(file_conv)
     
+    # Самопроверка
+    application.add_handler(CallbackQueryHandler(self_check, pattern='^self_check_'))
+    application.add_handler(CallbackQueryHandler(check_know, pattern='^check_know$'))
+    application.add_handler(CallbackQueryHandler(check_dont_know, pattern='^check_dont_know$'))
+    application.add_handler(CallbackQueryHandler(check_next, pattern='^check_next$'))
+    application.add_handler(CallbackQueryHandler(check_finish, pattern='^check_finish$'))
+    
+    # Настройки и экспорт
+    application.add_handler(CallbackQueryHandler(settings, pattern='^settings$'))
+    application.add_handler(CallbackQueryHandler(reminder_settings, pattern='^reminder_settings$'))
+    application.add_handler(CallbackQueryHandler(toggle_reminder, pattern='^toggle_reminder$'))
+    application.add_handler(CallbackQueryHandler(sharing_menu, pattern='^sharing_menu$'))
+    application.add_handler(CallbackQueryHandler(export_menu, pattern='^export_menu$'))
+    application.add_handler(CallbackQueryHandler(export_all_txt, pattern='^export_txt$'))
+    application.add_handler(CallbackQueryHandler(export_discipline, pattern='^export_discipline_'))
+    application.add_handler(CallbackQueryHandler(share_discipline, pattern='^share_discipline_'))
+    application.add_handler(CallbackQueryHandler(unshare_discipline, pattern='^unshare_'))
+    
+    # Файлы
+    application.add_handler(CallbackQueryHandler(view_files, pattern='^view_files_'))
+    application.add_handler(CallbackQueryHandler(manage_files, pattern='^manage_files_'))
+    application.add_handler(CallbackQueryHandler(delete_file, pattern='^delete_file_'))
+    
+    # Основная навигация
     application.add_handler(CallbackQueryHandler(my_disciplines, pattern='^my_disciplines$'))
     application.add_handler(CallbackQueryHandler(discipline_detail, pattern='^discipline_'))
     application.add_handler(CallbackQueryHandler(questions_list, pattern='^questions_list_'))
@@ -1679,7 +1771,13 @@ def main():
     application.add_handler(CallbackQueryHandler(countdown, pattern='^countdown$'))
     application.add_handler(CallbackQueryHandler(delete_discipline, pattern='^delete_discipline_'))
     application.add_handler(CallbackQueryHandler(delete_question, pattern='^delete_question_'))
-    application.add_handler(CallbackQueryHandler(back_to_main, pattern='^main_menu$'))
+    
+    # Кнопки "Назад"
+    application.add_handler(CallbackQueryHandler(back_handler, pattern='^main_menu$'))
+    application.add_handler(CallbackQueryHandler(back_handler, pattern='^settings$'))
+    application.add_handler(CallbackQueryHandler(back_handler, pattern='^reminder_settings$'))
+    application.add_handler(CallbackQueryHandler(back_handler, pattern='^sharing_menu$'))
+    application.add_handler(CallbackQueryHandler(back_handler, pattern='^export_menu$'))
     
     print("🎓 Бот для подготовки к сессии запущен!")
     application.run_polling()
