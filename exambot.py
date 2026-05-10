@@ -755,7 +755,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    TOKEN = "1077838057:AAFCwgQpcYxjwpLVvnBd_sEQZTHc-5aXIY0"
+    TOKEN = os.environ.get("TOKEN", "ВАШ_ТОКЕН_ЗДЕСЬ")
     
     application = Application.builder().token(TOKEN).build()
     
